@@ -1,0 +1,696 @@
+# packages required for Visium HD
+#install.packages("hdf5r")
+#install.packages("arrow")
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(SingleR)
+library(SingleCellExperiment)
+library(stringr)
+library(pheatmap)
+library(tidyr)
+
+
+set.seed(123)
+
+
+#######################################3
+localdir <- "/lustre/home/bucklab/projects/spatial_expression_hd/analysis/Hyb2_Spikein/outs/"
+obj <- Load10X_Spatial(data.dir = localdir, bin.size = c(8, 16))
+
+#8um for this analysis
+DefaultAssay(obj) <- "Spatial.008um"
+obj <- DietSeurat(obj, assays = "Spatial.008um", dimreducs = NULL, graphs = NULL)
+
+
+#####################################QC metrics + filtering
+
+obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^GRCh38-MT[-_]")
+obj[["percent.bact"]] <- PercentageFeatureSet(obj, pattern = "^bact---")
+
+obj <- subset(
+  obj,
+  subset = nCount_Spatial.008um >= 30 &
+    nFeature_Spatial.008um >= 20 &
+    nFeature_Spatial.008um <= 6000 &
+    percent.mt < 25
+)
+
+#QC plots
+VlnPlot(
+  obj,
+  features = c("nCount_Spatial.008um", "nFeature_Spatial.008um", "percent.mt", "percent.bact"),
+  pt.size = 0
+)
+
+
+#######Normalize + feature selection + scaling
+obj <- NormalizeData(obj, assay = "Spatial.008um")
+obj <- FindVariableFeatures(obj, assay = "Spatial.008um", nfeatures = 5000)
+
+# Keep bacteria in analysis; regress technical + bacterial fraction if desired
+obj <- ScaleData(
+  obj,
+  assay = "Spatial.008um",
+  features = VariableFeatures(obj),
+  vars.to.regress = c("nCount_Spatial.008um", "nFeature_Spatial.008um", "percent.mt", "percent.bact")
+)
+
+############################################PCA / neighbors / clustering / UMAP
+
+obj <- RunPCA(obj, assay = "Spatial.008um", features = VariableFeatures(obj), npcs = 50)
+obj <- FindNeighbors(obj, reduction = "pca", dims = 1:25)
+obj <- FindClusters(obj, resolution = 0.4)   # writes seurat_clusters
+obj <- RunUMAP(obj, reduction = "pca", dims = 1:25, n.neighbors = 25, min.dist = 0.3)
+
+DimPlot(obj, label = TRUE) + ggtitle("UMAP (8um)")
+
+
+
+
+
+
+#############################Marker genes
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+Idents(obj) <- "seurat_clusters"
+
+markers8 <- FindAllMarkers(
+  obj, assay = "Spatial.008um",
+  only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.5
+)
+
+top8 <- markers8 %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(avg_log2FC, n = 6, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+pdot <- DotPlot(obj, features = unique(top8$gene), group.by = "seurat_clusters") +
+  RotatedAxis() + scale_color_gradient2(
+    name = "Log2 Fold Change",
+    low = "blue", mid = "gray", high = "red", midpoint = 0
+  )
+
+
+
+#############################
+
+Idents(obj) <- "seurat_clusters"
+DefaultAssay(obj) <- "Spatial.008um"
+
+#Pseudobulk by cluster (genes x clusters)
+agg <- AggregateExpression(
+  obj,
+  assays = "Spatial.008um",
+  group.by = "seurat_clusters",
+  slot = "data",
+  return.seurat = FALSE
+)
+
+avg <- agg[["Spatial.008um"]]
+
+#plain numeric matrix check
+avg <- as.matrix(avg)
+storage.mode(avg) <- "numeric"
+
+#Correlation between clusters = correlation of columns
+cors <- cor(avg, method = "spearman", use = "pairwise.complete.obs")
+
+pheatmap(cors, main = "Cluster correlation (pseudobulk)")
+
+
+
+
+
+################################Single R HD to Single cell analysis
+
+DefaultAssay(obj) <- "Spatial.008um"
+Idents(obj) <- "seurat_clusters"   
+
+####Convert spatial sketch to single cell
+sce <- as.SingleCellExperiment(obj, assay = "Spatial.008um")
+
+#drop bacterial genes
+keep <- grepl("^GRCh38[-_]", rownames(sce)) & !grepl("^bact---", rownames(sce))
+sce_use <- sce[keep, ]
+
+# Harmonize symbols for reference matching
+rownames(sce_use) <- sub("^GRCh38[-_]", "", rownames(sce_use))
+sce_use <- sce_use[rownames(sce_use) != "", ]
+sce_use <- sce_use[!duplicated(rownames(sce_use)), ]
+
+#SingleR Reference
+ref <- celldex::BlueprintEncodeData()
+
+#use HVGs to speed up
+hvg <- sub("^GRCh38[-_]", "", VariableFeatures(obj))
+common <- intersect(hvg, intersect(rownames(sce_use), rownames(ref)))
+sce_use2 <- sce_use[common, ]
+ref2 <- ref[common, ]
+
+#Cluster-level SingleR (dominant type per cluster)
+pred_cl <- SingleR(
+  test = sce_use2,
+  ref = ref2,
+  labels = ref2$label.fine,
+  clusters = colData(sce_use2)$seurat_clusters
+)
+
+pred_cl[, c("labels", "pruned.labels", "delta.next")]
+
+
+
+
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+
+immune_genes <- c("GRCh38-PTPRC","GRCh38-CD3E","GRCh38-CD3E","GRCh38-NCF1",
+                  "GRCh38-ITGAM", "GRCh38-CD3D","GRCh38-CTLA4",
+                  "GRCh38-FCGR3A", "GRCh38-CXCL8",
+                  "GRCh38-GZMA", "GRCh38-CD8A", "GRCh38-CD4", "GRCh38-CD68","GRCh38-LYZ",
+                  "GRCh38-FOXP3", "GRCh38-CD163", "GRCh38-LY6D")
+immune_genes <- intersect(immune_genes, rownames(obj))
+
+obj <- AddModuleScore(obj, features = list(immune_genes), assay = "Spatial.008um", name = "ImmuneScore")
+imm_col <- grep("^ImmuneScore", colnames(obj@meta.data), value = TRUE)[1]
+
+thr <- quantile(obj[[imm_col]][,1], 0.99, na.rm = TRUE)   # start stringent
+obj$immune_candidate <- obj[[imm_col]][,1] >= thr
+
+table(obj$immune_candidate)
+FeaturePlot(obj, features = c("GRCh38-PTPRC","GRCh38-CD3E","GRCh38-CD3E","GRCh38-NCF1",
+                              "GRCh38-ITGAM", "GRCh38-CD3D","GRCh38-CTLA4",
+                              "GRCh38-FCGR3A", "GRCh38-CXCL8",
+                              "GRCh38-GZMA", "GRCh38-CD8A", "GRCh38-CD4", "GRCh38-CD68","GRCh38-LYZ",
+                              "GRCh38-FOXP3", "GRCh38-CD163", "GRCh38-LY6D"))
+              
+              
+DimPlot(obj, group.by = "immune_candidate")
+
+
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+Idents(obj) <- "seurat_clusters"
+
+#Subclass map
+cluster_subclass_map <- c(
+  "0" = "Epithelial_basal",
+  "1" = "Fibroblast_ECM",
+  "2" = "Fibroblast_state2",
+  "3" = "Epithelial_suprabasal",
+  "4" = "Epithelial_diff",
+  "5" = "Epithelial_state5",
+  "6" = "Transition_state",
+  "7" = "Transition_state2"
+)
+obj$subclass <- unname(cluster_subclass_map[as.character(obj$seurat_clusters)])
+
+# ----------------------------
+# 2) UPDATED immune sets (strict)
+#    Require pan-immune + lineage support
+# ----------------------------
+gene_sets2 <- list(
+  PanImmune = c("GRCh38-PTPRC"),
+  T_NK      = c("GRCh38-CD3D","GRCh38-CD3E","GRCh38-CD8A","GRCh38-CD4","GRCh38-GZMA"),
+  Myeloid   = c("GRCh38-LYZ","GRCh38-FCGR3A","GRCh38-CD68","GRCh38-ITGAM","GRCh38-NCF1"),
+  Bcell     = c("GRCh38-MS4A1","GRCh38-CD79A")
+)
+gene_sets2 <- lapply(gene_sets2, function(x) intersect(x, rownames(obj)))
+gene_sets2 <- gene_sets2[sapply(gene_sets2, length) >= 1]
+
+obj <- AddModuleScore(
+  obj,
+  features = gene_sets2,
+  assay = "Spatial.008um",
+  name = c("PanImmune_Score","T_NK_Score","Myeloid_Score","Bcell_Score")
+)
+
+pan_col <- grep("^PanImmune_Score", colnames(obj@meta.data), value = TRUE)[1]
+tnk_col <- grep("^T_NK_Score",      colnames(obj@meta.data), value = TRUE)[1]
+my_col  <- grep("^Myeloid_Score",   colnames(obj@meta.data), value = TRUE)[1]
+b_col   <- grep("^Bcell_Score",     colnames(obj@meta.data), value = TRUE)[1]
+
+# stringent thresholds
+thr_pan <- quantile(obj[[pan_col]][,1], 0.99,  na.rm = TRUE)
+thr_t   <- quantile(obj[[tnk_col]][,1], 0.995, na.rm = TRUE)
+thr_m   <- quantile(obj[[my_col]][,1],  0.995, na.rm = TRUE)
+thr_b   <- quantile(obj[[b_col]][,1],   0.995, na.rm = TRUE)
+
+pan_pos <- obj[[pan_col]][,1] >= thr_pan
+t_pos   <- obj[[tnk_col]][,1] >= thr_t
+m_pos   <- obj[[my_col]][,1]  >= thr_m
+b_pos   <- obj[[b_col]][,1]   >= thr_b
+
+obj$immune_subtype <- NA_character_
+obj$immune_subtype[pan_pos & t_pos] <- "Immune_T/NK-like"
+obj$immune_subtype[pan_pos & m_pos] <- "Immune_Myeloid-like"
+obj$immune_subtype[pan_pos & b_pos] <- "Immune_B-like"
+
+# resolve multi-hits by strongest lineage score
+multi <- pan_pos & (t_pos + m_pos + b_pos > 1)
+if (any(multi)) {
+  score_mat <- cbind(
+    T_NK = obj[[tnk_col]][,1],
+    Myeloid = obj[[my_col]][,1],
+    Bcell = obj[[b_col]][,1]
+  )
+  best <- apply(score_mat[multi, , drop = FALSE], 1, function(z) names(which.max(z)))
+  obj$immune_subtype[multi] <- paste0("Immune_", best, "-like")
+}
+
+# ----------------------------
+# 3) Overlay labels (same idea)
+# ----------------------------
+obj$subclass_overlay <- obj$subclass
+sel <- !is.na(obj$immune_subtype)
+obj$subclass_overlay[sel] <- paste0(obj$subclass[sel], " | ", obj$immune_subtype[sel])
+
+
+
+p_sub <- DimPlot(obj, group.by = "subclass", label = TRUE, repel = TRUE, label.size = 4) +
+  ggtitle("Subclass") + NoLegend()
+
+obj$immune_overlay <- ifelse(is.na(obj$immune_subtype), "Other", obj$immune_subtype)
+obj$immune_overlay <- factor(obj$immune_overlay,
+                             levels = c("Other","Immune_T/NK-like","Immune_Myeloid-like","Immune_B-like"))
+
+cols <- c(
+  "Other" = "grey85",
+  "Immune_T/NK-like" = "#7B3294",
+  "Immune_Myeloid-like" = "#008837",
+  "Immune_B-like" = "#1F78B4"
+)
+
+p_imm <- DimPlot(obj, group.by = "immune_overlay", cols = cols, pt.size = 0.25, shuffle = TRUE) +
+  ggtitle("Immune-like bins (strict overlay)")
+
+p_imm_lab <- LabelClusters(plot = p_imm, id = "immune_overlay", repel = TRUE, size = 4)
+
+p_sub + p_imm_lab
+
+
+# left: keep labels
+p_sub <- DimPlot(
+  obj, group.by = "subclass",
+  label = TRUE, repel = TRUE, label.size = 4
+) + ggtitle("Subclass") + NoLegend()
+
+# right: no on-plot labels (legend only)
+p_imm <- DimPlot(
+  obj, group.by = "immune_overlay",   # or immune_overlay
+  cols = cols, pt.size = 0.25, shuffle = TRUE,
+  label = FALSE
+) + ggtitle("Immune-like bins)")
+
+p_sub + p_imm
+
+
+
+
+
+outdir <- "/lustre/home/cunninghamme2/seurat/visium_HD/streamlined"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+
+
+###########################################save
+# Save object
+saveRDS(
+  obj,
+  file = file.path(outdir, "visiumHD_8um_streamlined_annotated_obj.rds"),
+  compress = "gzip"
+)
+#########################
+
+# Save metadata 
+meta_out <- obj@meta.data
+meta_out$cell_id <- rownames(meta_out)
+write.csv(meta_out, file.path(outdir, "cell_metadata_with_annotations.csv"), row.names = FALSE)
+
+# Core UMAPs
+p_clusters <- DimPlot(obj, group.by = "seurat_clusters", label = TRUE, repel = TRUE) +
+  ggtitle("UMAP clusters")
+
+p_subclass <- DimPlot(obj, group.by = "subclass", label = TRUE, repel = TRUE) +
+  ggtitle("Subclass")
+
+p_immune <- DimPlot(
+  obj,
+  group.by = "immune_overlay",   # or immune_overlay if using strict
+  cols = c(
+    "Other" = "grey85",
+    "Immune_T/NK-like" = "#7B3294",
+    "Immune_Myeloid-like" = "#008837",
+    "Immune_B-like" = "#1F78B4"
+  ),
+  pt.size = 0.25,
+  shuffle = TRUE,
+  label = FALSE
+) + ggtitle("Immune-like bins")
+
+p_final <- p_subclass + p_immune
+
+# Export figures
+ggsave(file.path(outdir, "umap_clusters_labeled.png"), p_clusters, width = 9, height = 7, dpi = 600)
+ggsave(file.path(outdir, "umap_subclass_labeled.png"), p_subclass, width = 9, height = 7, dpi = 600)
+ggsave(file.path(outdir, "umap_immune_overlay.png"), p_immune, width = 9, height = 7, dpi = 600)
+ggsave(file.path(outdir, "umap_subclass_plus_immune_overlay.png"), p_final, width = 14, height = 7, dpi = 600)
+
+# Keep your marker dotplot
+ggsave(file.path(outdir, "dotplot_top8_markers.png"), plot = pdot, width = 12, height = 8, dpi = 600)
+
+# Optional vector exports for manuscripts
+ggsave(file.path(outdir, "umap_subclass_plus_immune_overlay.pdf"), p_final, width = 14, height = 7)
+ggsave(file.path(outdir, "dotplot_top8_markers.pdf"), plot = pdot, width = 12, height = 8)
+
+
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+
+# ensure no NA
+obj$immune_overlay <- as.character(obj$immune_overlay)
+obj$immune_overlay[is.na(obj$immune_overlay)] <- "Other"
+obj$immune_overlay <- factor(
+  obj$immune_overlay,
+  levels = c("Other","Immune_T/NK-like","Immune_Myeloid-like","Immune_B-like")
+)
+
+# 1) DEBUG without histology image
+p_debug <- SpatialDimPlot(
+  obj,
+  group.by = "immune_overlay",
+  image.alpha = 0,                 # hide tissue image
+  pt.size.factor = 12,              # start moderate; 30 can be too much/odd
+  alpha = c(1, 1),                 # fully opaque points
+  cols = c(
+    "Other" = "lightgray",
+    "Immune_T/NK-like" = "red",
+    "Immune_Myeloid-like" = "green",
+    "Immune_B-like" = "#0073C2"
+  )
+) + ggtitle("DEBUG immune overlay (no histology)")
+p_debug
+
+
+
+p_tissue_immune <- SpatialDimPlot(
+  obj,
+  group.by = "immune_overlay",
+  image.alpha = 0.25,              # fade histology so points pop
+  pt.size.factor = 12,
+  alpha = c(0.9, 1),
+  cols = c(
+    "Other" = "lightgray",
+    "Immune_T/NK-like" = "red",
+    "Immune_Myeloid-like" = "green",
+    "Immune_B-like" = "#0073C2"
+  ),
+  stroke = 0
+) + ggtitle("Tissue map: immune-like bins")
+p_tissue_immune
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+
+# Build broad overlay from your subclass labels
+obj$broad_overlay <- "Other"
+obj$broad_overlay[grepl("^Epithelial", obj$subclass)] <- "Epithelial"
+obj$broad_overlay[grepl("^Fibroblast", obj$subclass)] <- "Fibroblast"
+obj$broad_overlay <- factor(obj$broad_overlay, levels = c("Other","Epithelial","Fibroblast"))
+
+# UMAP overlay
+p_umap_broad <- DimPlot(
+  obj,
+  group.by = "broad_overlay",
+  cols = c("Other"="grey80","Epithelial"="cyan","Fibroblast"="orange"),
+  pt.size = 0.25,
+  shuffle = TRUE
+) + ggtitle("Broad classes: Epithelial/Fibroblast")
+
+# Tissue overlay
+p_tissue_broad <- SpatialDimPlot(
+  obj,
+  group.by = "broad_overlay",
+  cols = c("Other"="grey80","Epithelial"="cyan","Fibroblast"="orange"),
+  image.alpha = 0.25,
+  pt.size.factor = 10,
+  alpha = c(0.9, 1)
+) + ggtitle("Tissue map: Epithelial/Fibroblast")
+
+p_umap_broad
+p_tissue_broad
+
+
+
+
+
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+
+# Keep only epithelial/fibroblast subclass names; everything else -> Other
+obj$epi_fib_sub_overlay <- as.character(obj$subclass)
+obj$epi_fib_sub_overlay[!(grepl("^Epithelial", obj$epi_fib_sub_overlay) |
+                            grepl("^Fibroblast", obj$epi_fib_sub_overlay))] <- "Other"
+
+# Set order (Other first)
+levs <- c("Other", sort(setdiff(unique(obj$epi_fib_sub_overlay), "Other")))
+obj$epi_fib_sub_overlay <- factor(obj$epi_fib_sub_overlay, levels = levs)
+
+# Make a color map: gray for Other + distinct colors for each subcluster
+n <- length(levs) - 1
+sub_cols <- scales::hue_pal()(n)
+cols_map <- c("Other" = "grey85")
+names(sub_cols) <- levs[-1]
+cols_map <- c(cols_map, sub_cols)
+
+# UMAP
+p_umap_sub <- DimPlot(
+  obj, group.by = "epi_fib_sub_overlay",
+  cols = cols_map, pt.size = 0.25, shuffle = TRUE, label = TRUE, repel = TRUE
+) + ggtitle("Epithelial/Fibroblast subclusters")
+
+# Tissue
+p_tissue_sub <- SpatialDimPlot(
+  obj, group.by = "epi_fib_sub_overlay",
+  cols = cols_map,
+  image.alpha = 0.25,
+  pt.size.factor = 10,
+  alpha = c(0.9, 1),
+  label = FALSE
+) + ggtitle("Tissue: Epithelial/Fibroblast subclusters")
+
+p_umap_sub
+p_tissue_sub
+
+
+
+
+
+# keep only epithelial/fibroblast bins
+obj_epi_fib <- subset(obj, subset = epi_fib_sub_overlay != "Other")
+Idents(obj_epi_fib) <- "epi_fib_sub_overlay"
+
+# explicit colors (named vector)
+cols_sub <- c(
+  "Epithelial_basal"     = "#F8766D",
+  "Epithelial_diff"      = "#B79F00",
+  "Epithelial_state5"    = "#00BA38",
+  "Epithelial_suprabasal"= "#00BFC4",
+  "Fibroblast_ECM"       = "#619CFF",
+  "Fibroblast_state2"    = "#F564E3"
+)
+
+p_tissue_sub_clean <- SpatialDimPlot(
+  obj_epi_fib,
+  group.by = "epi_fib_sub_overlay",
+  cols = cols_sub,
+  image.alpha = 0.2,
+  pt.size.factor = 8,
+  stroke = 0
+) + ggtitle("Tissue: Epithelial/Fibroblast subclusters (clean)")
+
+p_tissue_sub_clean
+
+
+
+
+
+#save
+outdir <- "/lustre/home/cunninghamme2/seurat/visium_HD/streamlined"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+
+save_plot <- function(p, filename, w = 9, h = 7, dpi = 600) {
+  ggsave(
+    filename = file.path(outdir, filename),
+    plot = p, width = w, height = h, dpi = dpi, limitsize = FALSE
+  )
+}
+
+# Immune overlays
+save_plot(p_debug,         "spatial_debug_immune_overlay_no_histology.png", w = 8, h = 10)
+save_plot(p_tissue_immune, "spatial_tissue_immune_overlay.png",             w = 8, h = 10)
+
+# Broad epi/fib overlays
+save_plot(p_umap_broad,    "umap_broad_epithelial_fibroblast.png",          w = 9, h = 7)
+save_plot(p_tissue_broad,  "spatial_broad_epithelial_fibroblast.png",       w = 8, h = 10)
+
+# Specific epi/fib subcluster overlays
+save_plot(p_umap_sub,          "umap_epi_fib_subclusters.png",              w = 10, h = 7)
+save_plot(p_tissue_sub,        "spatial_epi_fib_subclusters.png",           w = 8, h = 10)
+save_plot(p_tissue_sub_clean,  "spatial_epi_fib_subclusters_clean.png",     w = 8, h = 10)
+
+# Optional PDFs too (good for manuscripts)
+ggsave(file.path(outdir, "spatial_tissue_immune_overlay.pdf"), plot = p_tissue_immune, width = 8, height = 10)
+ggsave(file.path(outdir, "umap_epi_fib_subclusters.pdf"),      plot = p_umap_sub,      width = 10, height = 7)
+ggsave(file.path(outdir, "spatial_epi_fib_subclusters_clean.pdf"), plot = p_tissue_sub_clean, width = 8, height = 10)
+
+# quick check
+print(list.files(outdir, pattern = "png$|pdf$", full.names = TRUE))
+
+
+
+
+
+
+
+
+##########################cluster labeled dotplot
+
+obj <- readRDS("/lustre/home/cunninghamme2/seurat/visium_HD/streamlined/visiumHD_8um_streamlined_annotated_obj.rds")
+DefaultAssay(obj) <- "Spatial.008um"
+
+# make numbered labels from seurat_clusters + subclass
+obj$subclass_num <- paste0(
+  obj$seurat_clusters, "_", obj$subclass
+)
+
+# set plotting order by numeric cluster id
+ord <- obj@meta.data |>
+  dplyr::distinct(seurat_clusters, subclass_num) |>
+  dplyr::mutate(seurat_clusters_num = as.numeric(as.character(seurat_clusters))) |>
+  dplyr::arrange(seurat_clusters_num) |>
+  dplyr::pull(subclass_num)
+
+obj$subclass_num <- factor(obj$subclass_num, levels = ord)
+
+# dotplot using numbered labels
+features_use <- intersect(unique(top8$gene), rownames(obj))
+
+pdot_subclass_num <- DotPlot(
+  obj,
+  features = features_use,
+  group.by = "subclass_num",
+  assay = "Spatial.008um"
+) +
+  RotatedAxis() +
+  ggtitle("DotPlot: clusterID_subclass") +
+  scale_color_gradient2(
+    name = "Average expression (scaled)",
+    low = "blue", mid = "gray", high = "red", midpoint = 0
+  )
+
+pdot_subclass_num
+
+
+
+
+
+DefaultAssay(obj) <- "Spatial.008um"
+Idents(obj) <- "seurat_clusters"
+
+# 1) numbered labels: cluster_subclass
+obj$subclass_num <- paste0(obj$seurat_clusters, "_", obj$subclass)
+
+ord <- obj@meta.data %>%
+  distinct(seurat_clusters, subclass_num) %>%
+  mutate(seurat_clusters_num = as.numeric(as.character(seurat_clusters))) %>%
+  arrange(seurat_clusters_num) %>%
+  pull(subclass_num)
+
+obj$subclass_num <- factor(obj$subclass_num, levels = ord)
+
+
+p_dot <- DotPlot(
+  obj,
+  features = features_use,
+  group.by = "subclass_num",
+  assay = "Spatial.008um"
+) +
+  RotatedAxis() +
+  ggtitle("Average expression (DotPlot)") +
+  scale_color_gradient2(
+    name = "Average expression (scaled)",
+    low = "blue", mid = "gray", high = "red", midpoint = 0
+  )
+
+# 4) Full DE with signed log2FC (includes downregulated)
+markers_full <- FindAllMarkers(
+  obj,
+  assay = "Spatial.008um",
+  only.pos = FALSE,        # include downregulated
+  logfc.threshold = 0,     # keep all FC values
+  min.pct = 0.1
+)
+
+# map cluster id -> subclass label
+cluster_to_subclass <- obj@meta.data %>%
+  distinct(seurat_clusters, subclass_num) %>%
+  mutate(cluster = as.character(seurat_clusters)) %>%
+  select(cluster, subclass_num)
+
+df_fc <- markers_full %>%
+  mutate(cluster = as.character(cluster)) %>%
+  inner_join(cluster_to_subclass, by = "cluster") %>%
+  filter(gene %in% features_use) %>%
+  select(subclass_num, gene, avg_log2FC)
+
+# complete matrix; fill missing as 0 for display
+df_fc_full <- expand_grid(
+  subclass_num = levels(obj$subclass_num),
+  gene = features_use
+) %>%
+  left_join(df_fc, by = c("subclass_num", "gene")) %>%
+  mutate(avg_log2FC = ifelse(is.na(avg_log2FC), 0, avg_log2FC))
+
+# symmetric color limits around zero
+mx <- max(abs(df_fc_full$avg_log2FC), na.rm = TRUE)
+
+p_fc <- ggplot(df_fc_full, aes(x = subclass_num, y = gene, fill = avg_log2FC)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    name = "avg_log2FC",
+    low = "#3B4CC0", mid = "white", high = "#B40426",
+    midpoint = 0, limits = c(-mx, mx)
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+    axis.title = element_blank()
+  ) +
+  ggtitle("log2FC")
+
+# 5) combine
+p_side <- p_dot | p_fc
+p_side
+
+# 6) save
+ggsave(file.path(outdir, "dotplot_plus_signed_log2fc_heatmap.png"), p_side, width = 25, height = 8, dpi = 600)
+ggsave(file.path(outdir, "dotplot_plus_signed_log2fc_heatmap.pdf"), p_side, width = 20, height = 8)
